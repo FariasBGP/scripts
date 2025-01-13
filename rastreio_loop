@@ -1,0 +1,19 @@
+#!/bin/bash
+
+for p in {2..5}
+do
+
+        for i in {0..255}
+        do
+                n=`traceroute 200.100.20$p.$i|grep ms|wc|sed 's/ //g' |cut -d ' ' -f 1`
+
+                if [ $n -gt 800000 ]
+                        then
+                                echo 'LOOP - 200.100.20'$p'.'$i
+                        else
+                                echo 'OK - 200.100.20'$p'.'$i
+                fi
+        done
+
+done
+
