@@ -1,0 +1,229 @@
+#!/bin/bash
+# Script adaptado para Debian 13 (Trixie) limpo.
+# Instala dependências necessárias, configura Docker e roda containers para um lab de IA.
+# Sugestões incorporadas:
+# - Atualiza o sistema e instala pacotes básicos (wget, curl, etc.).
+# - Melhora checagens de existência de containers (usa docker inspect).
+# - Adiciona chown para pastas de volumes, evitando erros de permissão.
+# - Adiciona volume persistente para Redis-Cache (opcional, mas recomendado).
+# - Senhas e emails como variáveis no topo – ALTERE ANTES DE RODAR!
+# - Versão do N8N atualizada para latest (em 2025, 1.98.2 é antiga; use latest ou cheque docker hub).
+# - Error handling básico: Sai se falhar em passos críticos.
+# - Assume rodar como root (sudo bash script.sh).
+# - Teste em ambiente de dev; não use senhas default em prod.
+# - Para SSL real, mude EMAIL para um válido.
+
+# Variáveis configuráveis – ALTERE AQUI!
+ROOT_PASSWORD_SQL="sua_senha_forte_aqui"  # Para MariaDB e Postgres
+USER_NAME_SQL="usuario_padrao"
+USER_PASSWORD_SQL="sua_senha_forte_aqui"
+EMAIL_LETSENCRYPT="seu@email.real.com"  # Email real para certs Let's Encrypt
+DOMAIN="seu.dominio.com"  # Seu domínio real (ex: example.com)
+TZ="America/Sao_Paulo"  # Timezone
+N8N_VERSION="latest"  # Ou especifique uma versão recente
+
+# Atualiza sistema e instala dependências
+apt update && apt upgrade -y || { echo "Falha ao atualizar sistema!"; exit 1; }
+apt install -y wget curl sudo ca-certificates gnupg lsb-release || { echo "Falha ao instalar pacotes básicos!"; exit 1; }
+
+# Instala Docker se não existir
+if ! command -v docker &> /dev/null; then
+    echo "Instalando Docker..."
+    curl -fsSL https://get.docker.com -o /tmp/get-docker.sh || { echo "Falha ao baixar script Docker!"; exit 1; }
+    sh /tmp/get-docker.sh || { echo "Falha ao instalar Docker!"; exit 1; }
+    rm /tmp/get-docker.sh
+fi
+
+# Cria rede padrão se não existir
+if ! docker network inspect network_public &> /dev/null; then
+    echo "Criando rede network_public..."
+    docker network create -d bridge \
+        -o "com.docker.network.bridge.name"="br-net-public" \
+        --subnet 10.249.0.0/16 --gateway 10.249.255.254 \
+        network_public || { echo "Falha ao criar rede!"; exit 1; }
+fi
+
+# Traefik
+if ! docker inspect traefik-app &> /dev/null; then
+    NAME=traefik-app
+    LOCAL=$NAME.intranet.br
+    DATADIR=/storage/$NAME
+    mkdir -p $DATADIR/letsencrypt $DATADIR/logs $DATADIR/config
+    chown -R $(whoami):$(whoami) $DATADIR  # Ajusta perms (ajuste uid se preciso)
+    docker rm -f $NAME 2>/dev/null
+    docker run -d --restart=unless-stopped \
+      --name $NAME -h $LOCAL \
+      --network network_public \
+      --ip=10.249.255.253 \
+      -p 80:80 \
+      -p 443:443 \
+      -v /var/run/docker.sock:/var/run/docker.sock:ro \
+      -v $DATADIR/letsencrypt:/etc/letsencrypt \
+      -v $DATADIR/config:/etc/traefik \
+      -v $DATADIR/logs:/logs \
+      traefik:latest \
+      --global.checkNewVersion=false \
+      --global.sendAnonymousUsage=false \
+      --api.insecure=true \
+      --log.level=INFO \
+      --log.filePath=/logs/error.log \
+      --accessLog.filePath=/logs/access.log \
+      --entrypoints.web.address=:80 \
+      --entrypoints.web.http.redirections.entryPoint.to=websecure \
+      --entrypoints.web.http.redirections.entryPoint.scheme=https \
+      --entrypoints.web.http.redirections.entryPoint.permanent=true \
+      --entrypoints.websecure.address=:443 \
+      --providers.docker=true \
+      --providers.file.directory=/etc/traefik \
+      --certificatesresolvers.letsencrypt.acme.email=$EMAIL_LETSENCRYPT \
+      --certificatesresolvers.letsencrypt.acme.storage=/etc/letsencrypt/acme.json \
+      --certificatesresolvers.letsencrypt.acme.httpchallenge.entrypoint=web || { echo "Falha no Traefik!"; exit 1; }
+fi
+
+# Portainer
+if ! docker inspect portainer &> /dev/null; then
+    NAME=portainer
+    FQDN="$NAME.$DOMAIN"
+    LOCAL=$NAME.intranet.br
+    DATADIR=/storage/portainer
+    mkdir -p $DATADIR
+    chown -R 1000:1000 $DATADIR  # UID típico do Portainer
+    docker rm -f $NAME 2>/dev/null
+    docker run -d --restart=always \
+      --name $NAME -h $LOCAL \
+      --network network_public \
+      --ip=10.249.255.251 \
+      -e "TZ=$TZ" \
+      -p 8000:8000 \
+      -p 9443:9443 \
+      -v /var/run/docker.sock:/var/run/docker.sock \
+      --mount type=bind,source=$DATADIR,destination=/data,readonly=false \
+      --label "traefik.enable=true" \
+      --label "traefik.http.routers.portainer.rule=Host(\`$FQDN\`)" \
+      --label "traefik.http.routers.portainer.entrypoints=websecure" \
+      --label "traefik.http.routers.portainer.tls=true" \
+      --label "traefik.http.routers.portainer.tls.certresolver=letsencrypt" \
+      --label "traefik.http.services.portainer.loadbalancer.server.port=9000" \
+      portainer/portainer-ce:latest || { echo "Falha no Portainer!"; exit 1; }
+fi
+
+# Redis Cache (adicionado volume persistente)
+if ! docker inspect redis-cache &> /dev/null; then
+    DATADIR=/storage/redis-cache
+    mkdir -p $DATADIR
+    chown -R 1000:1000 $DATADIR  # UID do Redis
+    docker run -d --restart=always \
+      --name redis-cache -h redis-cache.intranet.br \
+      --network network_public \
+      --ip=10.249.255.151 \
+      -v $DATADIR:/data \
+      redis:8-alpine || { echo "Falha no Redis Cache!"; exit 1; }
+fi
+
+# Redis DB
+if ! docker inspect redis-db &> /dev/null; then
+    DATADIR=/storage/redis-db
+    mkdir -p $DATADIR
+    chown -R 1000:1000 $DATADIR
+    docker run -d --restart=always \
+      --name redis-db -h redis-db.intranet.br \
+      --network network_public \
+      --ip=10.249.255.152 \
+      -v $DATADIR:/data \
+      redis:8-alpine \
+      redis-server \
+      --bind '0.0.0.0 ::' \
+      --port 6379 \
+      --set-proc-title no \
+      --tcp-backlog 8192 \
+      --tcp-keepalive 30 \
+      --timeout 0 \
+      --save 900 1 \
+      --save 300 10 \
+      --save 60 10000 \
+      --dir /data \
+      --rdbcompression no \
+      --rdbchecksum yes \
+      --dbfilename data.rdb \
+      --appendonly yes \
+      --appendfsync everysec \
+      --appendfilename data.aof || { echo "Falha no Redis DB!"; exit 1; }
+fi
+
+# MariaDB
+if ! docker inspect mariadb-main &> /dev/null; then
+    START_DATABASE=admin
+    DATADIR=/storage/mariadb-main
+    mkdir -p $DATADIR
+    chown -R 999:999 $DATADIR  # UID típico do MariaDB
+    docker run -d --restart=always \
+      --name mariadb-main -h mariadb-main.intranet.br \
+      --network network_public \
+      --ip=10.249.255.100 \
+      -e "TZ=$TZ" \
+      -e "MYSQL_ROOT_PASSWORD=$ROOT_PASSWORD_SQL" \
+      -e "MYSQL_DATABASE=$START_DATABASE" \
+      -e "MYSQL_USER=$USER_NAME_SQL" \
+      -e "MYSQL_PASSWORD=$USER_PASSWORD_SQL" \
+      -v $DATADIR:/var/lib/mysql \
+      mariadb:latest || { echo "Falha no MariaDB!"; exit 1; }
+fi
+
+# PGSQL
+if ! docker inspect postgres-main &> /dev/null; then
+    DATADIR=/storage/postgres-main
+    mkdir -p $DATADIR
+    chown -R 999:999 $DATADIR  # UID do Postgres
+    docker run -d --restart=always \
+      --name postgres-main -h postgres-main.intranet.br \
+      --network network_public \
+      --ip=10.249.255.121 \
+      -e "TZ=$TZ" \
+      -e "POSTGRES_PASSWORD=$ROOT_PASSWORD_SQL" \
+      -e POSTGRES_INITDB_ARGS="--auth-host=scram-sha-256" \
+      -v $DATADIR:/var/lib/postgresql/data \
+      postgres:latest \
+      postgres --max_connections=8192 || { echo "Falha no Postgres!"; exit 1; }
+fi
+
+# PGvector
+if ! docker inspect pgvector-main &> /dev/null; then
+    DATADIR=/storage/pgvector-main
+    mkdir -p $DATADIR
+    chown -R 999:999 $DATADIR
+    docker run -d --restart=always \
+      --name pgvector-main -h pgvector-main.intranet.br \
+      --network network_public \
+      --ip=10.249.255.122 \
+      -e "TZ=$TZ" \
+      -e "POSTGRES_PASSWORD=$ROOT_PASSWORD_SQL" \
+      -e POSTGRES_INITDB_ARGS="--auth-host=scram-sha-256" \
+      -v $DATADIR:/var/lib/postgresql/data \
+      --entrypoint "docker-entrypoint.sh" \
+      pgvector/pgvector:pg16 \
+      postgres \
+      --max_connections=8192 \
+      --wal_level=minimal \
+      --max_wal_senders=0 \
+      --port=5432 || { echo "Falha no PGvector!"; exit 1; }
+fi
+
+# N8N
+if ! docker inspect n8n &> /dev/null; then
+    NAME=n8n
+    FQDN="$NAME.$DOMAIN"
+    DATADIR=/storage/n8n-data
+    NODEDIR=/storage/n8n-nodes
+    IMAGE=n8nio/n8n:$N8N_VERSION
+    mkdir -p $DATADIR $NODEDIR
+    chown -R 1000:1000 $DATADIR $NODEDIR
+    docker run -d --restart=always \
+      --name $NAME -h $NAME.intranet.br \
+      --network network_public \
+      --ip=10.249.255.10 \
+      -e TZ=$TZ \
+      -e N8N_HOST=$FQDN \
+      -e N8N_PORT=5678 \
+      -e N8N_PROTOCOL=https \
+      -e NODE_ENV=production \
+      -e WEBHOOK_URL=https
