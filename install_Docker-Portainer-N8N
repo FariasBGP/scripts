@@ -49,7 +49,7 @@ if ! docker inspect traefik-app &> /dev/null; then
     LOCAL=$NAME.intranet.br
     DATADIR=/storage/$NAME
     mkdir -p $DATADIR/letsencrypt $DATADIR/logs $DATADIR/config
-    chown -R $(whoami):$(whoami) $DATADIR  # Ajusta perms (ajuste uid se preciso)
+    chown -R $(whoami):$(whoami) $DATADIR
     docker rm -f $NAME 2>/dev/null
     docker run -d --restart=unless-stopped \
       --name $NAME -h $LOCAL \
@@ -87,7 +87,7 @@ if ! docker inspect portainer &> /dev/null; then
     LOCAL=$NAME.intranet.br
     DATADIR=/storage/portainer
     mkdir -p $DATADIR
-    chown -R 1000:1000 $DATADIR  # UID típico do Portainer
+    chown -R 1000:1000 $DATADIR
     docker rm -f $NAME 2>/dev/null
     docker run -d --restart=always \
       --name $NAME -h $LOCAL \
@@ -107,11 +107,11 @@ if ! docker inspect portainer &> /dev/null; then
       portainer/portainer-ce:latest || { echo "Falha no Portainer!"; exit 1; }
 fi
 
-# Redis Cache (adicionado volume persistente)
+# Redis Cache
 if ! docker inspect redis-cache &> /dev/null; then
     DATADIR=/storage/redis-cache
     mkdir -p $DATADIR
-    chown -R 1000:1000 $DATADIR  # UID do Redis
+    chown -R 1000:1000 $DATADIR
     docker run -d --restart=always \
       --name redis-cache -h redis-cache.intranet.br \
       --network network_public \
@@ -131,23 +131,7 @@ if ! docker inspect redis-db &> /dev/null; then
       --ip=10.249.255.152 \
       -v $DATADIR:/data \
       redis:8-alpine \
-      redis-server \
-      --bind '0.0.0.0 ::' \
-      --port 6379 \
-      --set-proc-title no \
-      --tcp-backlog 8192 \
-      --tcp-keepalive 30 \
-      --timeout 0 \
-      --save 900 1 \
-      --save 300 10 \
-      --save 60 10000 \
-      --dir /data \
-      --rdbcompression no \
-      --rdbchecksum yes \
-      --dbfilename data.rdb \
-      --appendonly yes \
-      --appendfsync everysec \
-      --appendfilename data.aof || { echo "Falha no Redis DB!"; exit 1; }
+      redis-server --bind '0.0.0.0 ::' --port 6379 --set-proc-title no --tcp-backlog 8192 --tcp-keepalive 30 --timeout 0 --save 900 1 --save 300 10 --save 60 10000 --dir /data --rdbcompression no --rdbchecksum yes --dbfilename data.rdb --appendonly yes --appendfsync everysec --appendfilename data.aof || { echo "Falha no Redis DB!"; exit 1; }
 fi
 
 # MariaDB
@@ -155,7 +139,7 @@ if ! docker inspect mariadb-main &> /dev/null; then
     START_DATABASE=admin
     DATADIR=/storage/mariadb-main
     mkdir -p $DATADIR
-    chown -R 999:999 $DATADIR  # UID típico do MariaDB
+    chown -R 999:999 $DATADIR
     docker run -d --restart=always \
       --name mariadb-main -h mariadb-main.intranet.br \
       --network network_public \
@@ -173,7 +157,7 @@ fi
 if ! docker inspect postgres-main &> /dev/null; then
     DATADIR=/storage/postgres-main
     mkdir -p $DATADIR
-    chown -R 999:999 $DATADIR  # UID do Postgres
+    chown -R 999:999 $DATADIR
     docker run -d --restart=always \
       --name postgres-main -h postgres-main.intranet.br \
       --network network_public \
@@ -201,11 +185,7 @@ if ! docker inspect pgvector-main &> /dev/null; then
       -v $DATADIR:/var/lib/postgresql/data \
       --entrypoint "docker-entrypoint.sh" \
       pgvector/pgvector:pg16 \
-      postgres \
-      --max_connections=8192 \
-      --wal_level=minimal \
-      --max_wal_senders=0 \
-      --port=5432 || { echo "Falha no PGvector!"; exit 1; }
+      postgres --max_connections=8192 --wal_level=minimal --max_wal_senders=0 --port=5432 || { echo "Falha no PGvector!"; exit 1; }
 fi
 
 # N8N
@@ -226,4 +206,35 @@ if ! docker inspect n8n &> /dev/null; then
       -e N8N_PORT=5678 \
       -e N8N_PROTOCOL=https \
       -e NODE_ENV=production \
-      -e WEBHOOK_URL=https
+      -e WEBHOOK_URL=https://$FQDN/ \
+      -e GENERIC_TIMEZONE=$TZ \
+      -e SSL_EMAIL=$EMAIL_LETSENCRYPT \
+      -e EXECUTIONS_DATA_PRUNE=true \
+      -e EXECUTIONS_DATA_MAX_AGE=24 \
+      -e EXECUTIONS_DATA_PRUNE_MAX_COUNT=512 \
+      -e EXECUTIONS_DATA_SAVE_ON_ERROR=all \
+      -e EXECUTIONS_DATA_SAVE_ON_SUCCESS=all \
+      -e EXECUTIONS_DATA_SAVE_ON_PROGRESS=true \
+      -e EXECUTIONS_DATA_SAVE_MANUAL_EXECUTIONS=true \
+      -e N8N_ENFORCE_SETTINGS_FILE_PERMISSIONS=true \
+      -e N8N_RUNNERS_ENABLED=true \
+      -e N8N_RUNNERS_MODE=internal \
+      -e N8N_NODE_PATH=/data/nodes \
+      -e N8N_CUSTOM_EXTENSIONS=/data/nodes \
+      -e N8N_COMMUNITY_PACKAGES_ENABLED=true \
+      -e N8N_REINSTALL_MISSING_PACKAGES=true \
+      -e N8N_COMMUNITY_PACKAGES_ALLOW_TOOL_USAGE=true \
+      -e OFFLOAD_MANUAL_EXECUTIONS_TO_WORKERS=false \
+      -v $DATADIR:/home/node/.n8n \
+      -v $NODEDIR:/data/nodes \
+      --label "traefik.enable=true" \
+      --label "traefik.http.routers.$NAME.rule=Host(\`$FQDN\`)" \
+      --label "traefik.http.routers.$NAME.entrypoints=web,websecure" \
+      --label "traefik.http.routers.$NAME.tls=true" \
+      --label "traefik.http.routers.$NAME.tls.certresolver=letsencrypt" \
+      --label "traefik.http.services.$NAME.loadbalancer.server.port=5678" \
+      $IMAGE || { echo "Falha no N8N!"; exit 1; }
+fi
+
+echo "Setup concluído! Acesse Portainer em https://portainer.$DOMAIN:9443 (configure senha inicial)."
+echo "Lembre: Mude senhas e domine o DNS pro Traefik funcionar."
